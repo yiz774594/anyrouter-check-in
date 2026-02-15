@@ -243,16 +243,40 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-		user_info = get_user_info(client, headers, user_info_url)
-		if user_info and user_info.get('success'):
-			print(user_info['display'])
-		elif user_info:
-			print(user_info.get('error', 'Unknown error'))
 
 		if provider_config.needs_manual_check_in():
+			# 签到前查询余额
+			before_info = get_user_info(client, headers, user_info_url)
+			before_quota = None
+			if before_info and before_info.get('success'):
+				before_quota = before_info['quota']
+				print(f'[INFO] {account_name}: Balance before check-in: ${before_quota}')
+
+			# 执行签到
 			success = execute_check_in(client, account_name, provider_config, headers)
+
+			# 签到后查询余额
+			user_info = get_user_info(client, headers, user_info_url)
+			if user_info and user_info.get('success'):
+				print(user_info['display'])
+				if before_quota is not None:
+					reward = round(user_info['quota'] - before_quota, 2)
+					user_info['reward'] = reward
+					if reward > 0:
+						print(f'[INFO] {account_name}: Check-in reward: +${reward}')
+					elif reward == 0:
+						print(f'[INFO] {account_name}: No reward (already checked in today?)')
+			elif user_info:
+				print(user_info.get('error', 'Unknown error'))
+
 			return success, user_info
 		else:
+			# 查询用户信息时自动完成签到
+			user_info = get_user_info(client, headers, user_info_url)
+			if user_info and user_info.get('success'):
+				print(user_info['display'])
+			elif user_info:
+				print(user_info.get('error', 'Unknown error'))
 			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
 			return True, user_info
 
@@ -305,23 +329,27 @@ async def main():
 			if user_info and user_info.get('success'):
 				current_quota = user_info['quota']
 				current_used = user_info['used_quota']
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
+				reward = user_info.get('reward')
+				current_balances[account_key] = {'quota': current_quota, 'used': current_used, 'reward': reward}
 
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
+				icon = '\u2705' if success else '\u274c'
+				line = f'{icon} <b>{account_name}</b>'
 				if user_info and user_info.get('success'):
-					account_result += f'\n{user_info["display"]}'
+					line += f'\n    \U0001f4b0 ${user_info["quota"]}  \u2502  Used ${user_info["used_quota"]}'
+					reward = user_info.get('reward')
+					if reward is not None and reward > 0:
+						line += f'\n    \U0001f381 Reward <b>+${reward}</b>'
 				elif user_info:
-					account_result += f'\n{user_info.get("error", "Unknown error")}'
-				notification_content.append(account_result)
+					line += f'\n    \u26a0\ufe0f {user_info.get("error", "Unknown error")}'
+				notification_content.append(line)
 
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
-			need_notify = True  # 异常也需要通知
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			need_notify = True
+			notification_content.append(f'\u274c <b>{account_name}</b>\n    \u26a0\ufe0f {str(e)[:50]}...')
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
@@ -345,12 +373,15 @@ async def main():
 			account_key = f'account_{i + 1}'
 			if account_key in current_balances:
 				account_name = account.get_display_name(i)
-				# 只添加成功获取余额的账号，且避免重复添加
-				account_result = f'[BALANCE] {account_name}'
-				account_result += f'\n:money: Current balance: ${current_balances[account_key]["quota"]}, Used: ${current_balances[account_key]["used"]}'
+				bal = current_balances[account_key]
+				line = f'\u2705 <b>{account_name}</b>'
+				line += f'\n    \U0001f4b0 ${bal["quota"]}  \u2502  Used ${bal["used"]}'
+				reward = bal.get('reward')
+				if reward is not None and reward > 0:
+					line += f'\n    \U0001f381 Reward <b>+${reward}</b>'
 				# 检查是否已经在通知内容中（避免重复）
 				if not any(account_name in item for item in notification_content):
-					notification_content.append(account_result)
+					notification_content.append(line)
 
 	# 保存当前余额hash
 	if current_balance_hash:
@@ -358,25 +389,21 @@ async def main():
 
 	if need_notify and notification_content:
 		# 构建通知内容
-		summary = [
-			'[STATS] Check-in result statistics:',
-			f'[SUCCESS] Success: {success_count}/{total_count}',
-			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
-		]
-
+		failed_count = total_count - success_count
 		if success_count == total_count:
-			summary.append('[SUCCESS] All accounts check-in successful!')
+			status_line = f'\u2705 All {total_count} accounts successful'
 		elif success_count > 0:
-			summary.append('[WARN] Some accounts check-in successful')
+			status_line = f'\u26a0\ufe0f {success_count} success / {failed_count} failed'
 		else:
-			summary.append('[ERROR] All accounts check-in failed')
+			status_line = f'\u274c All {total_count} accounts failed'
 
-		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-
-		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+		header = f'\U0001f4cb <b>Check-in Report</b>\n\u23f0 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\U0001f4ca {status_line}'
+		separator = '\u2500' * 20
+		accounts_block = '\n\n'.join(notification_content)
+		notify_content = f'{header}\n\n{separator}\n\n{accounts_block}\n\n{separator}'
 
 		print(notify_content)
-		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
+		notify.push_message('\U0001f4cb AnyRouter Check-in', notify_content, msg_type='html')
 		print('[NOTIFY] Notification sent due to failures or balance changes')
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
