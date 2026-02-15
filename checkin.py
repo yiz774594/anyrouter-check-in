@@ -167,8 +167,11 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 	return {**waf_cookies, **user_cookies}
 
 
+ALREADY_CHECKED_IN_KEYWORDS = ['已经签到', '已签到', '签过到', 'already', 'already checked', 'already signed']
+
+
 def execute_check_in(client, account_name: str, provider_config, headers: dict):
-	"""执行签到请求"""
+	"""执行签到请求，返回 (success: bool, already_checked_in: bool)"""
 	print(f'[NETWORK] {account_name}: Executing check-in')
 
 	checkin_headers = headers.copy()
@@ -184,22 +187,25 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 			result = response.json()
 			if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
 				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
+				return True, False
 			else:
 				error_msg = result.get('msg', result.get('message', 'Unknown error'))
+				# 检查是否是"已签到"
+				if any(kw in error_msg.lower() for kw in ALREADY_CHECKED_IN_KEYWORDS):
+					print(f'[SUCCESS] {account_name}: Already checked in today')
+					return True, True
 				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
-				return False
+				return False, False
 		except json.JSONDecodeError:
-			# 如果不是 JSON 响应，检查是否包含成功标识
 			if 'success' in response.text.lower():
 				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
+				return True, False
 			else:
 				print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
-				return False
+				return False, False
 	else:
 		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
-		return False
+		return False, False
 
 
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
@@ -253,19 +259,19 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 				print(f'[INFO] {account_name}: Balance before check-in: ${before_quota}')
 
 			# 执行签到
-			success = execute_check_in(client, account_name, provider_config, headers)
+			success, already = execute_check_in(client, account_name, provider_config, headers)
 
 			# 签到后查询余额
 			user_info = get_user_info(client, headers, user_info_url)
 			if user_info and user_info.get('success'):
 				print(user_info['display'])
-				if before_quota is not None:
+				if already:
+					user_info['already'] = True
+				elif before_quota is not None:
 					reward = round(user_info['quota'] - before_quota, 2)
 					user_info['reward'] = reward
 					if reward > 0:
 						print(f'[INFO] {account_name}: Check-in reward: +${reward}')
-					elif reward == 0:
-						print(f'[INFO] {account_name}: No reward (already checked in today?)')
 			elif user_info:
 				print(user_info.get('error', 'Unknown error'))
 
@@ -330,12 +336,15 @@ async def main():
 				current_quota = user_info['quota']
 				current_used = user_info['used_quota']
 				reward = user_info.get('reward')
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used, 'reward': reward}
+				already = user_info.get('already', False)
+				current_balances[account_key] = {'quota': current_quota, 'used': current_used, 'reward': reward, 'already': already}
 
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
 				icon = '\u2705' if success else '\u274c'
-				line = f'{icon} <b>{account_name}</b>'
+				already = user_info.get('already', False) if user_info else False
+				suffix = '  <i>(already checked in)</i>' if already else ''
+				line = f'{icon} <b>{account_name}</b>{suffix}'
 				if user_info and user_info.get('success'):
 					line += f'\n    \U0001f4b0 ${user_info["quota"]}  \u2502  Used ${user_info["used_quota"]}'
 					reward = user_info.get('reward')
@@ -374,7 +383,9 @@ async def main():
 			if account_key in current_balances:
 				account_name = account.get_display_name(i)
 				bal = current_balances[account_key]
-				line = f'\u2705 <b>{account_name}</b>'
+				already = bal.get('already', False)
+				suffix = '  <i>(already checked in)</i>' if already else ''
+				line = f'\u2705 <b>{account_name}</b>{suffix}'
 				line += f'\n    \U0001f4b0 ${bal["quota"]}  \u2502  Used ${bal["used"]}'
 				reward = bal.get('reward')
 				if reward is not None and reward > 0:
