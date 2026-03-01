@@ -317,48 +317,66 @@ async def main():
 	need_notify = False  # 是否需要发送通知
 	balance_changed = False  # 余额是否有变化
 
-	for i, account in enumerate(accounts):
+	# 并发签到，最多同时3个
+	MAX_CONCURRENT = 3
+	semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+	print(f'[INFO] Concurrency limit: {MAX_CONCURRENT}')
+
+	# 按索引预分配结果槽位，保证顺序
+	results = [None] * total_count
+
+	async def process_account(i, account):
+		"""带信号量的单账号处理"""
+		async with semaphore:
+			try:
+				success, user_info = await check_in_account(account, i, app_config)
+				return i, success, user_info
+			except Exception as e:
+				account_name = account.get_display_name(i)
+				print(f'[FAILED] {account_name} processing exception: {e}')
+				return i, False, {'error': str(e)[:50]}
+
+	# 并发执行所有账号
+	tasks = [process_account(i, account) for i, account in enumerate(accounts)]
+	results = await asyncio.gather(*tasks)
+
+	# 按原始顺序处理结果
+	for i, success, user_info in results:
+		account = accounts[i]
 		account_key = f'account_{i + 1}'
-		try:
-			success, user_info = await check_in_account(account, i, app_config)
-			if success:
-				success_count += 1
 
-			should_notify_this_account = False
+		if success:
+			success_count += 1
 
-			if not success:
-				should_notify_this_account = True
-				need_notify = True
-				account_name = account.get_display_name(i)
-				print(f'[NOTIFY] {account_name} failed, will send notification')
+		should_notify_this_account = False
 
-			if user_info and user_info.get('success'):
-				current_quota = user_info['quota']
-				current_used = user_info['used_quota']
-				reward = user_info.get('reward')
-				already = user_info.get('already', False)
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used, 'reward': reward, 'already': already}
-
-			if should_notify_this_account:
-				account_name = account.get_display_name(i)
-				icon = '\u2705' if success else '\u274c'
-				already = user_info.get('already', False) if user_info else False
-				suffix = '  <i>(already checked in)</i>' if already else ''
-				line = f'{icon} <b>{account_name}</b>{suffix}'
-				if user_info and user_info.get('success'):
-					line += f'\n    \U0001f4b0 ${user_info["quota"]}  \u2502  Used ${user_info["used_quota"]}'
-					reward = user_info.get('reward')
-					if reward is not None and reward > 0:
-						line += f'\n    \U0001f381 Reward <b>+${reward}</b>'
-				elif user_info:
-					line += f'\n    \u26a0\ufe0f {user_info.get("error", "Unknown error")}'
-				notification_content.append(line)
-
-		except Exception as e:
-			account_name = account.get_display_name(i)
-			print(f'[FAILED] {account_name} processing exception: {e}')
+		if not success:
+			should_notify_this_account = True
 			need_notify = True
-			notification_content.append(f'\u274c <b>{account_name}</b>\n    \u26a0\ufe0f {str(e)[:50]}...')
+			account_name = account.get_display_name(i)
+			print(f'[NOTIFY] {account_name} failed, will send notification')
+
+		if user_info and isinstance(user_info, dict) and user_info.get('success'):
+			current_quota = user_info['quota']
+			current_used = user_info['used_quota']
+			reward = user_info.get('reward')
+			already = user_info.get('already', False)
+			current_balances[account_key] = {'quota': current_quota, 'used': current_used, 'reward': reward, 'already': already}
+
+		if should_notify_this_account:
+			account_name = account.get_display_name(i)
+			icon = '\u2705' if success else '\u274c'
+			already = user_info.get('already', False) if isinstance(user_info, dict) else False
+			suffix = '  <i>(already checked in)</i>' if already else ''
+			line = f'{icon} <b>{account_name}</b>{suffix}'
+			if isinstance(user_info, dict) and user_info.get('success'):
+				line += f'\n    \U0001f4b0 ${user_info["quota"]}  \u2502  Used ${user_info["used_quota"]}'
+				reward = user_info.get('reward')
+				if reward is not None and reward > 0:
+					line += f'\n    \U0001f381 Reward <b>+${reward}</b>'
+			elif isinstance(user_info, dict) and 'error' in user_info:
+				line += f'\n    \u26a0\ufe0f {user_info.get("error", "Unknown error")}'
+			notification_content.append(line)
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
