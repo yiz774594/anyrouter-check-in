@@ -116,11 +116,42 @@ class NotificationKit:
 		if not self.telegram_bot_token or not self.telegram_chat_id:
 			raise ValueError('Telegram Bot Token or Chat ID not configured')
 
-		message = f'<b>{title}</b>\n\n{content}'
-		data = {'chat_id': self.telegram_chat_id, 'text': message, 'parse_mode': 'HTML'}
 		url = f'https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage'
+		full_message = f'<b>{title}</b>\n\n{content}'
+
+		# Telegram 单条消息限制 4096 字符，超长时分段发送
+		MAX_LEN = 4096
+		chunks = []
+		if len(full_message) <= MAX_LEN:
+			chunks.append(full_message)
+		else:
+			# 第一条带标题
+			header = f'<b>{title}</b>\n\n'
+			remaining = content
+			first_chunk_limit = MAX_LEN - len(header)
+
+			# 按双换行（账号块分隔符）切割
+			blocks = remaining.split('\n\n')
+			current = header
+			for block in blocks:
+				candidate = block if current == header else f'\n\n{block}'
+				if len(current) + len(candidate) > MAX_LEN:
+					if current and current != header:
+						chunks.append(current)
+					current = block
+				else:
+					current += candidate
+			if current:
+				chunks.append(current)
+
 		with httpx.Client(timeout=30.0) as client:
-			client.post(url, json=data)
+			for i, chunk in enumerate(chunks):
+				data = {'chat_id': self.telegram_chat_id, 'text': chunk, 'parse_mode': 'HTML'}
+				resp = client.post(url, json=data)
+				result = resp.json()
+				if not result.get('ok'):
+					error_desc = result.get('description', 'Unknown error')
+					raise ValueError(f'Telegram API error (part {i+1}/{len(chunks)}): {error_desc}')
 
 	def send_bark(self, title: str, content: str):
 		if not self.bark_key:
