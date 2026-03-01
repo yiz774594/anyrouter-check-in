@@ -410,7 +410,7 @@ async def main():
 
 		header = f'\U0001f4cb <b>Check-in Report</b>\n\u23f0 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\U0001f4ca {status_line}'
 		separator = '\u2500' * 20
-		accounts_block = '\n\n'.join(notification_content)
+		accounts_block = '\n\n'.join(f'<b>{idx+1}.</b> {item}' for idx, item in enumerate(notification_content))
 		notify_content = f'{header}\n\n{separator}\n\n{accounts_block}\n\n{separator}'
 
 		print(notify_content)
