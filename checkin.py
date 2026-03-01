@@ -396,6 +396,14 @@ async def main():
 
 	# 为有余额变化的情况添加所有成功账号到通知内容
 	if balance_changed:
+		# 收集已在通知中的账号名（精确匹配，避免子串误判）
+		notified_names = set()
+		for item in notification_content:
+			for i2, acc2 in enumerate(accounts):
+				n = acc2.get_display_name(i2)
+				if f'<b>{n}</b>' in item:
+					notified_names.add(n)
+
 		for i, account in enumerate(accounts):
 			account_key = f'account_{i + 1}'
 			if account_key in current_balances:
@@ -408,9 +416,10 @@ async def main():
 				reward = bal.get('reward')
 				if reward is not None and reward > 0:
 					line += f'\n    \U0001f381 Reward <b>+${reward}</b>'
-				# 检查是否已经在通知内容中（避免重复）
-				if not any(account_name in item for item in notification_content):
+				# 检查是否已经在通知内容中（避免重复，使用精确匹配）
+				if account_name not in notified_names:
 					notification_content.append(line)
+					notified_names.add(account_name)
 
 	# 保存当前余额hash
 	if current_balance_hash:
