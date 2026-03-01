@@ -69,9 +69,28 @@ jobs:
         restore-keys: |
           balance-hash-
 
+    - name: 合并账号配置
+      shell: python
+      env:
+        ACCOUNTS_1: ${{ secrets.ANYROUTER_ACCOUNTS_1 }}
+        ACCOUNTS_2: ${{ secrets.ANYROUTER_ACCOUNTS_2 }}
+        ACCOUNTS_3: ${{ secrets.ANYROUTER_ACCOUNTS_3 }}
+      run: |
+        import json, os
+        parts = []
+        for key in ("ACCOUNTS_1", "ACCOUNTS_2", "ACCOUNTS_3"):
+            raw = os.environ.get(key, "").strip()
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    parts.extend(data)
+        merged = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+            f.write(f"ANYROUTER_ACCOUNTS={merged}\n")
+        print(f"合并完成: {len(parts)} 个账号")
+
     - name: 执行签到
       env:
-        ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
         PROVIDERS: ${{ secrets.PROVIDERS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
