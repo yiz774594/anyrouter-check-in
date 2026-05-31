@@ -63,7 +63,7 @@ class ProviderConfig:
 
 	def needs_manual_check_in(self) -> bool:
 		"""判断是否需要手动调用签到接口"""
-		return self.sign_in_path is not None
+		return bool(self.sign_in_path)
 
 
 @dataclass
@@ -187,5 +187,4 @@ def load_accounts_config() -> list[AccountConfig] | None:
 	except Exception as e:
 		print(f'ERROR: Account configuration format is incorrect: {e}')
 		return None
-
 
