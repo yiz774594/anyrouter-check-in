@@ -22,6 +22,7 @@ load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
 SAFE_ACCEPT_ENCODING = 'gzip, deflate'
+PROXY_ENV_KEYS = ['OUTBOUND_PROXY', 'ALL_PROXY', 'HTTPS_PROXY', 'HTTP_PROXY']
 COMPAT_API_USER_KEYS = [
 	'new-api-user',
 	'New-API-User',
@@ -74,6 +75,58 @@ def parse_cookies(cookies_data):
 				cookies_dict[key] = value
 		return cookies_dict
 	return {}
+
+
+def resolve_proxy_url() -> str | None:
+	"""从环境变量读取代理 URL。"""
+	for key in PROXY_ENV_KEYS:
+		value = str(os.getenv(key, '') or '').strip()
+		if value:
+			return value
+	return None
+
+
+def sanitize_proxy_url(proxy_url: str | None) -> str:
+	"""隐藏代理凭据，仅保留协议、主机和端口用于日志。"""
+	if not proxy_url:
+		return ''
+	parsed = urllib.parse.urlparse(proxy_url)
+	if not parsed.scheme or not parsed.hostname:
+		return proxy_url
+	host = parsed.hostname
+	if ':' in host and not host.startswith('['):
+		host = f'[{host}]'
+	port_part = f':{parsed.port}' if parsed.port else ''
+	return f'{parsed.scheme}://{host}{port_part}'
+
+
+def parse_playwright_proxy_settings(proxy_url: str | None) -> dict | None:
+	"""将代理 URL 转换为 Playwright 需要的 proxy 配置。"""
+	if not proxy_url:
+		return None
+	parsed = urllib.parse.urlparse(proxy_url)
+	if not parsed.scheme or not parsed.hostname:
+		raise ValueError(f'Invalid proxy URL: {proxy_url}')
+	host = parsed.hostname
+	if ':' in host and not host.startswith('['):
+		host = f'[{host}]'
+	server = f'{parsed.scheme}://{host}'
+	if parsed.port:
+		server += f':{parsed.port}'
+	settings = {'server': server}
+	if parsed.username:
+		settings['username'] = urllib.parse.unquote(parsed.username)
+	if parsed.password is not None:
+		settings['password'] = urllib.parse.unquote(parsed.password)
+	return settings
+
+
+def create_http_client(proxy_url: str | None = None):
+	"""创建 HTTP 客户端；配置了代理时显式走代理，未配置则不走代理。"""
+	client_kwargs = {'http2': True, 'timeout': 30.0, 'trust_env': False}
+	if proxy_url:
+		client_kwargs['proxy'] = proxy_url
+	return httpx.Client(**client_kwargs)
 
 
 def build_base_headers(provider_config, api_user: str) -> dict:
@@ -220,6 +273,7 @@ def _apply_refreshed_cookies(client, all_cookies: dict, playwright_result: dict)
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
 	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
+	proxy_settings = parse_playwright_proxy_settings(resolve_proxy_url())
 
 	async with async_playwright() as p:
 		import tempfile
@@ -228,6 +282,7 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 			context = await p.chromium.launch_persistent_context(
 				user_data_dir=temp_dir,
 				headless=False,
+				proxy=proxy_settings,
 				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
 				viewport={'width': 1920, 'height': 1080},
 				args=[
@@ -326,6 +381,7 @@ async def perform_playwright_api_request(
 	parsed = urllib.parse.urlparse(provider_config.domain)
 	if not parsed.scheme or not parsed.hostname:
 		return {'ok': False, 'status_code': 0, 'error': f'Invalid provider domain: {provider_config.domain}'}
+	proxy_settings = parse_playwright_proxy_settings(resolve_proxy_url())
 
 	cookies = []
 	for name, value in (all_cookies or {}).items():
@@ -344,6 +400,7 @@ async def perform_playwright_api_request(
 	async with async_playwright() as p:
 		browser = await p.chromium.launch(
 			headless=True,
+			proxy=proxy_settings,
 			args=[
 				'--disable-blink-features=AutomationControlled',
 				'--disable-dev-shm-usage',
@@ -579,7 +636,8 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	if not all_cookies:
 		return False, None
 
-	client = httpx.Client(http2=True, timeout=30.0)
+	proxy_url = resolve_proxy_url()
+	client = create_http_client(proxy_url)
 
 	try:
 		client.cookies.update(all_cookies)
@@ -645,6 +703,11 @@ async def main():
 	"""主函数"""
 	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
 	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+	proxy_url = resolve_proxy_url()
+	if proxy_url:
+		print(f'[INFO] Outbound proxy enabled: {sanitize_proxy_url(proxy_url)}')
+	else:
+		print('[INFO] Outbound proxy disabled')
 
 	app_config = AppConfig.load_from_env()
 	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
