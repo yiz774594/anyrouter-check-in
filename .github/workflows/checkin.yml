@@ -92,6 +92,7 @@ jobs:
     - name: 执行签到
       env:
         PROVIDERS: ${{ secrets.PROVIDERS }}
+        OUTBOUND_PROXY: ${{ secrets.OUTBOUND_PROXY }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
