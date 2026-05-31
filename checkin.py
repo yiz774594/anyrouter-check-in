@@ -116,6 +116,29 @@ def build_browser_api_headers(provider_config, api_user: str, include_json_body:
 	return headers
 
 
+def build_playwright_entry_candidates(provider_config, entry_path: str | None = '/console') -> list[str]:
+	"""构建浏览器预热页面候选列表，优先控制台页面，其次首页，最后登录页。"""
+	candidates = []
+
+	def add_candidate(entry: str | None):
+		entry = str(entry or '').strip()
+		if not entry:
+			return
+		if entry.startswith('http://') or entry.startswith('https://'):
+			target_url = entry
+		else:
+			target_url = f"{provider_config.domain}{entry if entry.startswith('/') else '/' + entry}"
+		if target_url not in candidates:
+			candidates.append(target_url)
+
+	add_candidate(entry_path)
+	add_candidate('/console/token')
+	add_candidate('/console')
+	add_candidate('/')
+	add_candidate(provider_config.login_path)
+	return candidates
+
+
 def _contains_already_checked(text: str) -> bool:
 	text_lower = str(text or '').lower()
 	return any(kw in text_lower for kw in ALREADY_CHECKED_IN_KEYWORDS)
@@ -165,6 +188,33 @@ def _format_check_in_result(payload, response_text: str = '') -> dict:
 		return {'success': True, 'already': False, 'error': ''}
 
 	return {'success': False, 'already': False, 'error': 'Invalid response format'}
+
+
+def _cookie_domain_matches(cookie_domain: str, host: str) -> bool:
+	cookie_host = str(cookie_domain or '').lstrip('.').lower()
+	host = str(host or '').lower()
+	return bool(cookie_host) and (host == cookie_host or host.endswith('.' + cookie_host))
+
+
+def _extract_cookie_artifacts(cookie_items: list[dict], host: str) -> tuple[dict, str]:
+	cookie_map = {}
+	for item in cookie_items or []:
+		name = str(item.get('name') or '').strip()
+		value = item.get('value')
+		domain = item.get('domain')
+		if name and value is not None and _cookie_domain_matches(domain, host):
+			cookie_map[name] = str(value)
+	full_cookie = '; '.join(f'{key}={value}' for key, value in cookie_map.items())
+	return cookie_map, full_cookie
+
+
+def _apply_refreshed_cookies(client, all_cookies: dict, playwright_result: dict):
+	cookie_map = dict(playwright_result.get('cookies') or {})
+	if cookie_map:
+		all_cookies.update(cookie_map)
+		if client is not None and getattr(client, 'cookies', None) is not None:
+			client.cookies.update(cookie_map)
+	return cookie_map
 
 
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
@@ -268,6 +318,7 @@ async def perform_playwright_api_request(
 	url: str,
 	method: str = 'GET',
 	payload: dict | None = None,
+	entry_path: str | None = '/console',
 ):
 	"""在浏览器页面上下文中执行 API 请求。"""
 	print(f'[PROCESSING] {account_name}: Retrying via Playwright page context...')
@@ -288,16 +339,7 @@ async def perform_playwright_api_request(
 			}
 		)
 
-	entry_candidates = []
-	for entry in [provider_config.login_path, '/console/token', '/console', '/']:
-		if not entry:
-			continue
-		if entry.startswith('http://') or entry.startswith('https://'):
-			target_url = entry
-		else:
-			target_url = f"{provider_config.domain}{entry if entry.startswith('/') else '/' + entry}"
-		if target_url not in entry_candidates:
-			entry_candidates.append(target_url)
+	entry_candidates = build_playwright_entry_candidates(provider_config, entry_path)
 
 	async with async_playwright() as p:
 		browser = await p.chromium.launch(
@@ -355,9 +397,18 @@ async def perform_playwright_api_request(
 				""",
 				{'url': url, 'method': method.upper(), 'headers': js_headers, 'payload': payload},
 			)
+			browser_cookies, full_cookie = _extract_cookie_artifacts(await context.cookies(), parsed.hostname)
 			if isinstance(result, dict):
+				result.setdefault('cookies', browser_cookies)
+				result.setdefault('full_cookie', full_cookie)
 				return result
-			return {'ok': False, 'status_code': 0, 'error': 'Invalid Playwright response'}
+			return {
+				'ok': False,
+				'status_code': 0,
+				'error': 'Invalid Playwright response',
+				'cookies': browser_cookies,
+				'full_cookie': full_cookie,
+			}
 		finally:
 			await context.close()
 			await browser.close()
@@ -384,7 +435,13 @@ async def get_user_info_with_fallback(
 		all_cookies,
 		user_info_url,
 		method='GET',
+		entry_path='/console',
 	)
+	if _apply_refreshed_cookies(client, all_cookies, playwright_result):
+		retry_result = get_user_info_http(client, headers, user_info_url)
+		if retry_result.get('success'):
+			return retry_result
+
 	if playwright_result.get('ok'):
 		result = _format_user_info_result(playwright_result.get('body') or {})
 		result['status_code'] = playwright_result.get('status_code', 0)
@@ -474,7 +531,13 @@ async def execute_check_in_with_fallback(
 		sign_in_url,
 		method='POST',
 		payload={},
+		entry_path='/console',
 	)
+	if _apply_refreshed_cookies(client, all_cookies, playwright_result):
+		retry_result = execute_check_in_http(client, account_name, provider_config, headers)
+		if retry_result.get('success'):
+			return retry_result
+
 	if playwright_result.get('ok'):
 		check_in_result = _format_check_in_result(playwright_result.get('body'), playwright_result.get('text', ''))
 		check_in_result['status_code'] = playwright_result.get('status_code', 0)
