@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+import urllib.parse
 from datetime import datetime
 
 import httpx
@@ -20,6 +21,16 @@ from utils.notify import notify
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+SAFE_ACCEPT_ENCODING = 'gzip, deflate'
+COMPAT_API_USER_KEYS = [
+	'new-api-user',
+	'New-API-User',
+	'Veloera-User',
+	'voapi-user',
+	'User-id',
+	'Rix-Api-User',
+	'neo-api-user',
+]
 
 
 def load_balance_hash():
@@ -63,6 +74,97 @@ def parse_cookies(cookies_data):
 				cookies_dict[key] = value
 		return cookies_dict
 	return {}
+
+
+def build_base_headers(provider_config, api_user: str) -> dict:
+	"""构建 HTTP 请求基础 headers。"""
+	headers = {
+		'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'Accept-Encoding': SAFE_ACCEPT_ENCODING,
+		'Referer': provider_config.domain,
+		'Origin': provider_config.domain,
+		'Connection': 'keep-alive',
+		'Sec-Fetch-Dest': 'empty',
+		'Sec-Fetch-Mode': 'cors',
+		'Sec-Fetch-Site': 'same-origin',
+	}
+
+	for header_key in [*COMPAT_API_USER_KEYS, provider_config.api_user_key]:
+		if header_key:
+			headers[header_key] = api_user
+
+	return headers
+
+
+def build_browser_api_headers(provider_config, api_user: str, include_json_body: bool) -> dict:
+	"""构建页面上下文 fetch 可用的 headers。"""
+	headers = {
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'X-Requested-With': 'XMLHttpRequest',
+	}
+
+	if include_json_body:
+		headers['Content-Type'] = 'application/json'
+
+	for header_key in [*COMPAT_API_USER_KEYS, provider_config.api_user_key]:
+		if header_key:
+			headers[header_key] = api_user
+
+	return headers
+
+
+def _contains_already_checked(text: str) -> bool:
+	text_lower = str(text or '').lower()
+	return any(kw in text_lower for kw in ALREADY_CHECKED_IN_KEYWORDS)
+
+
+def _safe_response_preview(response, limit: int = 120) -> str:
+	raw = getattr(response, 'content', b'')
+	if isinstance(raw, bytes):
+		text = raw.decode('utf-8', errors='replace')
+	else:
+		text = str(raw)
+	text = text.replace('\r', ' ').replace('\n', ' ')
+	return text[:limit]
+
+
+def _format_user_info_result(data: dict, error_prefix: str = 'Failed to get user info') -> dict:
+	if isinstance(data, dict) and data.get('success'):
+		user_data = data.get('data', {}) or {}
+		quota = round(user_data.get('quota', 0) / 500000, 2)
+		used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+		return {
+			'success': True,
+			'quota': quota,
+			'used_quota': used_quota,
+			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		}
+
+	message = ''
+	if isinstance(data, dict):
+		message = str(data.get('message') or data.get('msg') or data.get('error') or '').strip()
+	if not message:
+		message = 'API returned unsuccessful response'
+	return {'success': False, 'error': f'{error_prefix}: {message}'}
+
+
+def _format_check_in_result(payload, response_text: str = '') -> dict:
+	if isinstance(payload, dict):
+		if payload.get('ret') == 1 or payload.get('code') == 0 or payload.get('success'):
+			return {'success': True, 'already': False, 'error': ''}
+
+		error_msg = str(payload.get('msg') or payload.get('message') or payload.get('error') or 'Unknown error')
+		if _contains_already_checked(error_msg):
+			return {'success': True, 'already': True, 'error': ''}
+		return {'success': False, 'already': False, 'error': error_msg}
+
+	if 'success' in str(response_text or '').lower():
+		return {'success': True, 'already': False, 'error': ''}
+
+	return {'success': False, 'already': False, 'error': 'Invalid response format'}
 
 
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
@@ -129,26 +231,174 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				return None
 
 
-def get_user_info(client, headers, user_info_url: str):
-	"""获取用户信息"""
+def get_user_info_http(client, headers, user_info_url: str):
+	"""通过 HTTP 获取用户信息。"""
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
 		if response.status_code == 200:
-			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+			try:
+				data = response.json()
+			except Exception as e:
+				preview = _safe_response_preview(response)
 				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					'success': False,
+					'error': f'Failed to get user info: invalid JSON response ({e}). Preview: {preview}',
+					'status_code': response.status_code,
 				}
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
+
+			result = _format_user_info_result(data)
+			result['status_code'] = response.status_code
+			return result
+
+		return {
+			'success': False,
+			'error': f'Failed to get user info: HTTP {response.status_code}',
+			'status_code': response.status_code,
+		}
 	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+		return {'success': False, 'error': f'Failed to get user info: {str(e)[:120]}', 'status_code': 0}
+
+
+async def perform_playwright_api_request(
+	account_name: str,
+	account: AccountConfig,
+	provider_config,
+	all_cookies: dict,
+	url: str,
+	method: str = 'GET',
+	payload: dict | None = None,
+):
+	"""在浏览器页面上下文中执行 API 请求。"""
+	print(f'[PROCESSING] {account_name}: Retrying via Playwright page context...')
+
+	parsed = urllib.parse.urlparse(provider_config.domain)
+	if not parsed.scheme or not parsed.hostname:
+		return {'ok': False, 'status_code': 0, 'error': f'Invalid provider domain: {provider_config.domain}'}
+
+	cookies = []
+	for name, value in (all_cookies or {}).items():
+		cookies.append(
+			{
+				'name': str(name),
+				'value': str(value),
+				'domain': parsed.hostname,
+				'path': '/',
+				'secure': parsed.scheme == 'https',
+			}
+		)
+
+	entry_candidates = []
+	for entry in [provider_config.login_path, '/console/token', '/console', '/']:
+		if not entry:
+			continue
+		if entry.startswith('http://') or entry.startswith('https://'):
+			target_url = entry
+		else:
+			target_url = f"{provider_config.domain}{entry if entry.startswith('/') else '/' + entry}"
+		if target_url not in entry_candidates:
+			entry_candidates.append(target_url)
+
+	async with async_playwright() as p:
+		browser = await p.chromium.launch(
+			headless=True,
+			args=[
+				'--disable-blink-features=AutomationControlled',
+				'--disable-dev-shm-usage',
+				'--disable-web-security',
+				'--disable-features=VizDisplayCompositor',
+				'--no-sandbox',
+			],
+		)
+		context = await browser.new_context(
+			user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+			viewport={'width': 1920, 'height': 1080},
+		)
+		try:
+			if cookies:
+				await context.add_cookies(cookies)
+
+			page = await context.new_page()
+			last_error = None
+			for target_url in entry_candidates:
+				try:
+					await page.goto(target_url, wait_until='domcontentloaded', timeout=60000)
+					await page.wait_for_timeout(1200)
+					last_error = None
+					break
+				except Exception as e:
+					last_error = e
+
+			if last_error is not None:
+				return {'ok': False, 'status_code': 0, 'error': f'Unable to open provider page: {last_error}'}
+
+			js_headers = build_browser_api_headers(provider_config, account.api_user, method.upper() != 'GET')
+			result = await page.evaluate(
+				"""
+				async ({ url, method, headers, payload }) => {
+					try {
+						const options = { method, headers, credentials: 'include' };
+						if (payload !== null && payload !== undefined) {
+							options.body = JSON.stringify(payload);
+						}
+						const resp = await fetch(url, options);
+						const text = await resp.text();
+						let body = null;
+						try {
+							body = text ? JSON.parse(text) : null;
+						} catch (e) {}
+						return { ok: resp.ok, status_code: resp.status, body, text };
+					} catch (error) {
+						return { ok: false, status_code: 0, error: String(error), body: null, text: '' };
+					}
+				}
+				""",
+				{'url': url, 'method': method.upper(), 'headers': js_headers, 'payload': payload},
+			)
+			if isinstance(result, dict):
+				return result
+			return {'ok': False, 'status_code': 0, 'error': 'Invalid Playwright response'}
+		finally:
+			await context.close()
+			await browser.close()
+
+
+async def get_user_info_with_fallback(
+	client,
+	headers: dict,
+	user_info_url: str,
+	account_name: str,
+	account: AccountConfig,
+	provider_config,
+	all_cookies: dict,
+):
+	"""HTTP 失败后回退 Playwright 获取用户信息。"""
+	http_result = get_user_info_http(client, headers, user_info_url)
+	if http_result.get('success'):
+		return http_result
+
+	playwright_result = await perform_playwright_api_request(
+		account_name,
+		account,
+		provider_config,
+		all_cookies,
+		user_info_url,
+		method='GET',
+	)
+	if playwright_result.get('ok'):
+		result = _format_user_info_result(playwright_result.get('body') or {})
+		result['status_code'] = playwright_result.get('status_code', 0)
+		if result.get('success'):
+			return result
+		if playwright_result.get('text'):
+			result['error'] = f"{result['error']}. Preview: {str(playwright_result.get('text'))[:120]}"
+		return result
+
+	return {
+		'success': False,
+		'error': playwright_result.get('error') or http_result.get('error', 'Failed to get user info'),
+		'status_code': playwright_result.get('status_code', http_result.get('status_code', 0)),
+	}
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -170,42 +420,79 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 ALREADY_CHECKED_IN_KEYWORDS = ['已经签到', '已签到', '签过到', 'already', 'already checked', 'already signed']
 
 
-def execute_check_in(client, account_name: str, provider_config, headers: dict):
-	"""执行签到请求，返回 (success: bool, already_checked_in: bool)"""
+def execute_check_in_http(client, account_name: str, provider_config, headers: dict) -> dict:
+	"""执行 HTTP 签到请求。"""
 	print(f'[NETWORK] {account_name}: Executing check-in')
 
 	checkin_headers = headers.copy()
 	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
 
 	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
-	response = client.post(sign_in_url, headers=checkin_headers, timeout=30)
+	response = client.post(sign_in_url, headers=checkin_headers, json={}, timeout=30)
 
 	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
 
 	if response.status_code == 200:
 		try:
 			result = response.json()
-			if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True, False
-			else:
-				error_msg = result.get('msg', result.get('message', 'Unknown error'))
-				# 检查是否是"已签到"
-				if any(kw in error_msg.lower() for kw in ALREADY_CHECKED_IN_KEYWORDS):
-					print(f'[SUCCESS] {account_name}: Already checked in today')
-					return True, True
-				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
-				return False, False
-		except json.JSONDecodeError:
-			if 'success' in response.text.lower():
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True, False
-			else:
-				print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
-				return False, False
-	else:
-		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
-		return False, False
+		except Exception:
+			result = None
+
+		check_in_result = _format_check_in_result(result, _safe_response_preview(response))
+		check_in_result['status_code'] = response.status_code
+		if check_in_result['success'] and check_in_result.get('already'):
+			print(f'[SUCCESS] {account_name}: Already checked in today')
+		elif check_in_result['success']:
+			print(f'[SUCCESS] {account_name}: Check-in successful!')
+		else:
+			print(f'[FAILED] {account_name}: Check-in failed - {check_in_result["error"]}')
+		return check_in_result
+
+	print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
+	return {'success': False, 'already': False, 'error': f'HTTP {response.status_code}', 'status_code': response.status_code}
+
+
+async def execute_check_in_with_fallback(
+	client,
+	account_name: str,
+	account: AccountConfig,
+	provider_config,
+	headers: dict,
+	all_cookies: dict,
+) -> dict:
+	"""HTTP 失败后回退 Playwright 执行签到。"""
+	http_result = execute_check_in_http(client, account_name, provider_config, headers)
+	if http_result.get('success'):
+		return http_result
+
+	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
+	playwright_result = await perform_playwright_api_request(
+		account_name,
+		account,
+		provider_config,
+		all_cookies,
+		sign_in_url,
+		method='POST',
+		payload={},
+	)
+	if playwright_result.get('ok'):
+		check_in_result = _format_check_in_result(playwright_result.get('body'), playwright_result.get('text', ''))
+		check_in_result['status_code'] = playwright_result.get('status_code', 0)
+		print(f'[RESPONSE] {account_name}: Playwright response status code {check_in_result["status_code"]}')
+		if check_in_result['success'] and check_in_result.get('already'):
+			print(f'[SUCCESS] {account_name}: Already checked in today')
+		elif check_in_result['success']:
+			print(f'[SUCCESS] {account_name}: Check-in successful!')
+		else:
+			print(f'[FAILED] {account_name}: Check-in failed - {check_in_result["error"]}')
+		return check_in_result
+
+	return {
+		'success': False,
+		'already': False,
+		'error': playwright_result.get('error') or http_result.get('error', 'Check-in failed'),
+		'status_code': playwright_result.get('status_code', http_result.get('status_code', 0)),
+	}
 
 
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
@@ -234,35 +521,31 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	try:
 		client.cookies.update(all_cookies)
 
-		headers = {
-			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-			'Accept': 'application/json, text/plain, */*',
-			'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-			'Accept-Encoding': 'gzip, deflate, br, zstd',
-			'Referer': provider_config.domain,
-			'Origin': provider_config.domain,
-			'Connection': 'keep-alive',
-			'Sec-Fetch-Dest': 'empty',
-			'Sec-Fetch-Mode': 'cors',
-			'Sec-Fetch-Site': 'same-origin',
-			provider_config.api_user_key: account.api_user,
-		}
+		headers = build_base_headers(provider_config, account.api_user)
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 
 		if provider_config.needs_manual_check_in():
 			# 签到前查询余额
-			before_info = get_user_info(client, headers, user_info_url)
+			before_info = await get_user_info_with_fallback(
+				client, headers, user_info_url, account_name, account, provider_config, all_cookies
+			)
 			before_quota = None
 			if before_info and before_info.get('success'):
 				before_quota = before_info['quota']
 				print(f'[INFO] {account_name}: Balance before check-in: ${before_quota}')
 
 			# 执行签到
-			success, already = execute_check_in(client, account_name, provider_config, headers)
+			check_in_result = await execute_check_in_with_fallback(
+				client, account_name, account, provider_config, headers, all_cookies
+			)
+			success = check_in_result.get('success', False)
+			already = check_in_result.get('already', False)
 
 			# 签到后查询余额
-			user_info = get_user_info(client, headers, user_info_url)
+			user_info = await get_user_info_with_fallback(
+				client, headers, user_info_url, account_name, account, provider_config, all_cookies
+			)
 			if user_info and user_info.get('success'):
 				print(user_info['display'])
 				if already:
@@ -278,7 +561,9 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			return success, user_info
 		else:
 			# 查询用户信息时自动完成签到
-			user_info = get_user_info(client, headers, user_info_url)
+			user_info = await get_user_info_with_fallback(
+				client, headers, user_info_url, account_name, account, provider_config, all_cookies
+			)
 			if user_info and user_info.get('success'):
 				print(user_info['display'])
 			elif user_info:
