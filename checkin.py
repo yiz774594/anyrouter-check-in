@@ -121,6 +121,29 @@ def parse_playwright_proxy_settings(proxy_url: str | None) -> dict | None:
 	return settings
 
 
+def prepare_playwright_proxy_settings(proxy_url: str | None) -> tuple[dict | None, str | None]:
+	"""为 Playwright 准备代理配置；带认证的 SOCKS 代理会自动降级为浏览器直连。"""
+	if not proxy_url:
+		return None, None
+	parsed = urllib.parse.urlparse(proxy_url)
+	if not parsed.scheme or not parsed.hostname:
+		raise ValueError(f'Invalid proxy URL: {proxy_url}')
+	has_auth = parsed.username is not None or parsed.password is not None
+	if parsed.scheme.lower().startswith('socks') and has_auth:
+		return None, 'Browser does not support socks5 proxy authentication, falling back to direct browser connection'
+	return parse_playwright_proxy_settings(proxy_url), None
+
+
+def resolve_http_proxy_for_provider(provider_config, proxy_url: str | None) -> tuple[str | None, str | None]:
+	"""为单个 provider 解析 HTTP 代理策略。"""
+	if not proxy_url:
+		return None, None
+	_, browser_warning = prepare_playwright_proxy_settings(proxy_url)
+	if provider_config.needs_waf_cookies() and browser_warning:
+		return None, 'WAF provider will use direct HTTP because browser proxy is skipped and the exit IP must stay consistent'
+	return proxy_url, None
+
+
 def create_http_client(proxy_url: str | None = None):
 	"""创建 HTTP 客户端；配置了代理时显式走代理，未配置则不走代理。"""
 	client_kwargs = {'http2': True, 'timeout': 30.0, 'trust_env': False}
@@ -273,7 +296,9 @@ def _apply_refreshed_cookies(client, all_cookies: dict, playwright_result: dict)
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
 	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
-	proxy_settings = parse_playwright_proxy_settings(resolve_proxy_url())
+	proxy_settings, proxy_warning = prepare_playwright_proxy_settings(resolve_proxy_url())
+	if proxy_warning:
+		print(f'[WARNING] {account_name}: {proxy_warning}')
 
 	async with async_playwright() as p:
 		import tempfile
@@ -381,7 +406,9 @@ async def perform_playwright_api_request(
 	parsed = urllib.parse.urlparse(provider_config.domain)
 	if not parsed.scheme or not parsed.hostname:
 		return {'ok': False, 'status_code': 0, 'error': f'Invalid provider domain: {provider_config.domain}'}
-	proxy_settings = parse_playwright_proxy_settings(resolve_proxy_url())
+	proxy_settings, proxy_warning = prepare_playwright_proxy_settings(resolve_proxy_url())
+	if proxy_warning:
+		print(f'[WARNING] {account_name}: {proxy_warning}')
 
 	cookies = []
 	for name, value in (all_cookies or {}).items():
@@ -542,7 +569,12 @@ def execute_check_in_http(client, account_name: str, provider_config, headers: d
 	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
 
 	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
-	response = client.post(sign_in_url, headers=checkin_headers, json={}, timeout=30)
+	try:
+		response = client.post(sign_in_url, headers=checkin_headers, json={}, timeout=30)
+	except Exception as e:
+		error_msg = str(e)[:160] or 'HTTP request failed'
+		print(f'[FAILED] {account_name}: Check-in HTTP request failed - {error_msg}')
+		return {'success': False, 'already': False, 'error': error_msg, 'status_code': 0}
 
 	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
 
@@ -637,7 +669,10 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None
 
 	proxy_url = resolve_proxy_url()
-	client = create_http_client(proxy_url)
+	http_proxy_url, http_proxy_warning = resolve_http_proxy_for_provider(provider_config, proxy_url)
+	if http_proxy_warning:
+		print(f'[WARNING] {account_name}: {http_proxy_warning}')
+	client = create_http_client(http_proxy_url)
 
 	try:
 		client.cookies.update(all_cookies)
